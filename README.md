@@ -11,6 +11,7 @@ Monitor public websites and APIs, measure service reliability, and track inciden
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![CI](https://github.com/Adityagithubhack/pulsewatch/actions/workflows/ci.yml/badge.svg)](https://github.com/Adityagithubhack/pulsewatch/actions/workflows/ci.yml)
 
 </div>
 
@@ -176,6 +177,20 @@ Current verification status:
 - TypeScript validation passes
 - Production dependency audit reports zero known vulnerabilities
 
+## Continuous Integration and Deployment
+
+The GitHub Actions pipeline validates every push and pull request by running:
+
+- Ruff backend linting
+- Pytest backend tests
+- Next.js production build and TypeScript validation
+- Production dependency audit
+- Docker Compose image builds
+
+A separate guarded workflow can deploy successful `main` builds to a DigitalOcean server through SSH. Deployment stays disabled until the required secrets and the `ENABLE_DEPLOY` repository variable are configured.
+
+See [DigitalOcean Deployment](docs/DEPLOYMENT.md) for the complete server and GitHub configuration.
+
 ## Project Structure
 
 ```text
@@ -194,6 +209,8 @@ pulsewatch/
 │   ├── app/                 Next.js App Router
 │   ├── components/          Dashboard UI
 │   └── lib/                 API client and TypeScript models
+├── .github/workflows/   CI and guarded deployment workflows
+├── docs/                Deployment documentation
 ├── docker-compose.yml
 └── .env.example
 ```
@@ -216,4 +233,3 @@ pulsewatch/
 **Aditya Singh**
 
 - GitHub: [@Adityagithubhack](https://github.com/Adityagithubhack)
-
