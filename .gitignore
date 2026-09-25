@@ -7,3 +7,6 @@ node_modules/
 .next/
 coverage/
 
+
+.DS_Store
+PulseWatch_*/

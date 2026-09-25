@@ -26,9 +26,22 @@ The project uses asynchronous API handlers, background task processing, persiste
 - Configurable `GET` and `HEAD` monitors for public websites and APIs
 - Automated health checks using Celery workers and Celery Beat
 - Live service state, HTTP response code, and latency monitoring
-- Rolling 24-hour uptime, average latency, and P95 latency metrics
+- Interactive 24-hour, 7-day, and 30-day latency analytics
+- Fleet uptime, P95 latency, health score, SLO posture, and estimated error budget
+- Dedicated monitor inventory with search, state filters, and CSV export
+- Monitor detail console with recent check history and pause/resume controls
+- Consecutive-failure and recovery confirmation policies to reduce alert noise
+- Global or per-service maintenance windows with automatic incident suppression
 - Automatic incident creation when a service fails
 - Automatic incident resolution when the service recovers
+- Incident acknowledgement, manual resolution, operator attribution, and audit history
+- Separate blocked-probe state for WAF and rate-limit responses
+- Exponential retry/backoff for transient network and upstream failures
+- DNS rebinding protection plus live DNS and TLS certificate diagnostics
+- Telegram, generic webhook, and SMTP email incident notifications
+- Customer-facing public status page and JSON status feed
+- Prometheus-compatible metrics and database/Redis readiness probes
+- Optional operator authentication with scrypt-hashed passwords and HttpOnly sessions
 - Searchable check history stored in PostgreSQL
 - Redis pub/sub event distribution and WebSocket streaming
 - Responsive Next.js operations dashboard
@@ -56,9 +69,10 @@ flowchart LR
 2. Redis queues a monitoring task for each due endpoint.
 3. A Celery worker performs the HTTP request and measures latency.
 4. The result is persisted in PostgreSQL.
-5. A state transition from `up` to `down` opens an incident.
-6. A transition from `down` to `up` resolves the active incident.
-7. Redis publishes the new result for real-time consumers.
+5. Transient failures are retried with exponential backoff before classification.
+6. A state transition from `up` to `down` opens an incident.
+7. A transition from `down` to `up` resolves the active incident.
+8. Redis publishes the new result for real-time consumers.
 
 ## Technology Stack
 
@@ -127,6 +141,12 @@ All six services should be running, with PostgreSQL and Redis reporting healthy.
 | `REDIS_URL` | Celery broker, result backend, and pub/sub URL | `redis://redis:6379/0` |
 | `NEXT_PUBLIC_API_URL` | Browser-accessible FastAPI base URL | `http://localhost:8000` |
 | `FRONTEND_ORIGIN` | Allowed dashboard origin for CORS | `http://localhost:3001` |
+| `PROBE_REGION` | Region label attached to every check | `local` |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Optional Telegram incident notifications | Disabled |
+| `ALERT_WEBHOOK_URL` | Optional generic JSON webhook destination | Disabled |
+| `SMTP_*`, `ALERT_EMAIL_*` | Optional SMTP email escalation | Disabled |
+| `AUTH_ENABLED` | Require login for every mutating operation | `false` |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Bootstrap credentials when authentication is enabled | Empty |
 
 ## API Reference
 
@@ -142,8 +162,20 @@ All six services should be running, with PostgreSQL and Redis reporting healthy.
 | `GET` | `/api/endpoints/{id}/checks` | Read recent check history |
 | `GET` | `/api/endpoints/{id}/metrics` | Calculate rolling uptime and latency metrics |
 | `GET` | `/api/incidents` | Read the incident and recovery timeline |
+| `PATCH` | `/api/incidents/{id}` | Acknowledge, annotate, or resolve an incident |
+| `GET`, `POST` | `/api/maintenance` | List and schedule maintenance windows |
+| `GET` | `/api/endpoints/{id}/diagnostics` | Inspect DNS and live TLS certificate health |
+| `GET` | `/api/audit` | Read the immutable operations activity feed |
+| `GET` | `/api/public/status` | Read the customer-safe public status feed |
 | `GET` | `/api/dashboard/summary` | Read operational dashboard totals |
 | `WS` | `/ws/checks` | Stream live monitoring results |
+
+Operational endpoints:
+
+- Public status page: `/status`
+- Readiness probe: `/health/ready`
+- Prometheus metrics: `/metrics`
+- Secure operator login: `/login` (when `AUTH_ENABLED=true`)
 
 Interactive OpenAPI documentation is available at `/docs` while the API is running.
 
@@ -190,6 +222,7 @@ The GitHub Actions pipeline validates every push and pull request by running:
 A separate guarded workflow can deploy successful `main` builds to a DigitalOcean server through SSH. Deployment stays disabled until the required secrets and the `ENABLE_DEPLOY` repository variable are configured.
 
 See [DigitalOcean Deployment](docs/DEPLOYMENT.md) for the complete server and GitHub configuration.
+See [Operations Guide](docs/OPERATIONS.md) for authentication, notifications, incident policy, and production endpoints.
 
 ## Project Structure
 
@@ -219,13 +252,10 @@ pulsewatch/
 
 - Authentication and per-user monitor ownership
 - Team workspaces and role-based access control
-- Interactive 24-hour, 7-day, and 30-day latency charts
-- Incident acknowledgement, notes, and maintenance windows
-- Public status pages for monitored services
-- Email and generic webhook notification channels
-- SSL certificate and domain-expiration monitoring
+- Team workspaces, SSO, and fine-grained role-based access control
+- Dedicated remote probe agents for genuine multi-region monitoring
+- Domain-registration expiration monitoring
 - Alembic database migrations
-- GitHub Actions CI/CD and cloud deployment
 - DNS resolution checks for stronger SSRF protection
 
 ## Author

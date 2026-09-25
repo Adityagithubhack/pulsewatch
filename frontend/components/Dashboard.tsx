@@ -1,173 +1,176 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { api, Endpoint, Incident, Metrics, Summary } from "../lib/api";
+import { api, AuditEntry, Check, Diagnostics, Endpoint, Incident, MaintenanceWindow, Metrics, NotificationStatus, Summary } from "../lib/api";
 
-const emptySummary: Summary = { total: 0, up: 0, down: 0, paused: 0, average_latency_ms: null };
+type View = "overview" | "monitors" | "incidents" | "operations";
+type StatusFilter = "all" | "up" | "down" | "blocked" | "paused";
+type RangeHours = 24 | 168 | 720;
+
+const emptySummary: Summary = { total: 0, up: 0, down: 0, blocked: 0, paused: 0, average_latency_ms: null };
+const rangeLabels: Record<RangeHours, string> = { 24: "24H", 168: "7D", 720: "30D" };
+
+function endpointState(endpoint: Endpoint): StatusFilter | "pending" {
+  if (!endpoint.is_active) return "paused";
+  return endpoint.latest_check?.availability ?? "pending";
+}
+
+function formatNumber(value: number | null, suffix = "") {
+  return value == null ? "—" : `${Math.round(value).toLocaleString()}${suffix}`;
+}
+
+function relativeTime(value: string | null) {
+  if (!value) return "Never";
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+function incidentDuration(incident: Incident) {
+  const end = incident.resolved_at ? new Date(incident.resolved_at).getTime() : Date.now();
+  const minutes = Math.max(1, Math.round((end - new Date(incident.opened_at).getTime()) / 60_000));
+  return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+function StatusBadge({ state }: { state: StatusFilter | "pending" }) {
+  const label = state === "up" ? "Operational" : state === "down" ? "Outage" : state[0].toUpperCase() + state.slice(1);
+  return <span className={`status-badge ${state}`}><i />{label}</span>;
+}
+
+function LatencyChart({ checks, compact = false }: { checks: Check[]; compact?: boolean }) {
+  const points = checks.filter((check) => check.availability !== "blocked" && check.latency_ms != null).slice(-60);
+  if (points.length < 2) return <div className={`chart-empty ${compact ? "compact" : ""}`}>More probe data is needed to draw this chart.</div>;
+  const width = 720, height = compact ? 130 : 210, padding = 14;
+  const values = points.map((point) => point.latency_ms ?? 0);
+  const max = Math.max(...values, 1) * 1.12;
+  const coordinates = values.map((value, index) => [padding + (index / (values.length - 1)) * (width - padding * 2), height - padding - (value / max) * (height - padding * 2)] as const);
+  const line = coordinates.map(([x, y], index) => `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const area = `${line} L${coordinates.at(-1)?.[0]},${height - padding} L${coordinates[0][0]},${height - padding} Z`;
+  const gradientId = compact ? "areaSmall" : "areaLarge";
+  return <div className="chart-wrap"><svg className="latency-chart" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="Latency trend"><defs><linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#6d8cff" stopOpacity=".38" /><stop offset="100%" stopColor="#6d8cff" stopOpacity="0" /></linearGradient></defs>{[0.2, 0.5, 0.8].map((ratio) => <line key={ratio} x1="0" x2={width} y1={height * ratio} y2={height * ratio} className="chart-grid" />)}<path d={area} fill={`url(#${gradientId})`} /><path d={line} className="chart-line" /></svg><div className="chart-axis"><span>{relativeTime(points[0].checked_at)}</span><span>Now</span></div></div>;
+}
 
 export function Dashboard() {
+  const [view, setView] = useState<View>("overview");
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
   const [summary, setSummary] = useState<Summary>(emptySummary);
   const [metrics, setMetrics] = useState<Record<string, Metrics>>({});
   const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [maintenance, setMaintenance] = useState<MaintenanceWindow[]>([]);
+  const [notifications, setNotifications] = useState<NotificationStatus>({ telegram: false, webhook: false, email: false });
+  const [auditLog, setAuditLog] = useState<AuditEntry[]>([]);
+  const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
+  const [timeRange, setTimeRange] = useState<RangeHours>(24);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [showForm, setShowForm] = useState(false);
+  const [showMaintenance, setShowMaintenance] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [incidentFilter, setIncidentFilter] = useState<"all" | "open" | "resolved">("all");
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (quiet = false) => {
+    if (!quiet) setRefreshing(true);
     try {
-      const [endpointData, summaryData, incidentData] = await Promise.all([
-        api.endpoints(),
-        api.summary(),
-        api.incidents(),
-      ]);
-      const metricData = await Promise.all(endpointData.map((endpoint) => api.metrics(endpoint.id)));
-      setEndpoints(endpointData);
-      setSummary(summaryData);
-      setIncidents(incidentData);
+      const [endpointData, summaryData, incidentData, maintenanceData, notificationData, auditData] = await Promise.all([api.endpoints(), api.summary(), api.incidents(), api.maintenance(), api.notificationStatus(), api.audit()]);
+      const metricData = await Promise.all(endpointData.map((endpoint) => api.metrics(endpoint.id, timeRange)));
+      setEndpoints(endpointData); setSummary(summaryData); setIncidents(incidentData);
+      setMaintenance(maintenanceData); setNotifications(notificationData); setAuditLog(auditData);
       setMetrics(Object.fromEntries(metricData.map((metric) => [metric.endpoint_id, metric])));
-      setError("");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to load PulseWatch");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+      setLastUpdated(new Date()); setError("");
+    } catch (err) { setError(err instanceof Error ? err.message : "Unable to load PulseWatch"); }
+    finally { setLoading(false); setRefreshing(false); }
+  }, [timeRange]);
 
-  useEffect(() => {
-    load();
-    const timer = window.setInterval(load, 15_000);
-    return () => window.clearInterval(timer);
-  }, [load]);
+  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { if (!autoRefresh) return; const timer = window.setInterval(() => void load(true), 15_000); return () => window.clearInterval(timer); }, [autoRefresh, load]);
+  useEffect(() => { setDiagnostics(null); }, [selectedId]);
+
+  const selectedEndpoint = endpoints.find((endpoint) => endpoint.id === selectedId) ?? null;
+  const selectedMetrics = selectedId ? metrics[selectedId] : null;
+  const chartMetrics = selectedMetrics ?? Object.values(metrics).find((metric) => metric.series.length > 1) ?? null;
+  const activeIncidents = incidents.filter((incident) => !incident.resolved_at);
+  const resolvedIncidents = incidents.filter((incident) => incident.resolved_at);
+  const fleetUptimes = Object.values(metrics).flatMap((metric) => metric.uptime_percentage == null ? [] : [metric.uptime_percentage]);
+  const fleetUptime = fleetUptimes.length ? fleetUptimes.reduce((sum, value) => sum + value, 0) / fleetUptimes.length : null;
+  const resolvedDurations = resolvedIncidents.map((incident) => (new Date(incident.resolved_at!).getTime() - new Date(incident.opened_at).getTime()) / 60_000);
+  const mttr = resolvedDurations.length ? resolvedDurations.reduce((sum, value) => sum + value, 0) / resolvedDurations.length : null;
+  const sloTarget = 99.9, permittedDowntime = timeRange * 60 * (1 - sloTarget / 100);
+  const observedDowntime = fleetUptime == null ? null : timeRange * 60 * (1 - fleetUptime / 100);
+  const budgetRemaining = observedDowntime == null ? null : Math.max(0, permittedDowntime - observedDowntime);
+  const activeCount = Math.max(0, summary.total - summary.paused);
+  const healthScore = activeCount ? Math.round((summary.up / activeCount) * 100) : null;
+
+  const filteredEndpoints = useMemo(() => endpoints.filter((endpoint) => `${endpoint.name} ${endpoint.url}`.toLowerCase().includes(search.toLowerCase()) && (statusFilter === "all" || endpointState(endpoint) === statusFilter)), [endpoints, search, statusFilter]);
+  const filteredIncidents = incidents.filter((incident) => incidentFilter === "all" || (incidentFilter === "open" ? !incident.resolved_at : incident.resolved_at));
+  const statusText = useMemo(() => !summary.total ? "No monitors configured" : summary.down ? `${summary.down} service${summary.down > 1 ? "s" : ""} require attention` : summary.blocked ? `${summary.blocked} probe${summary.blocked > 1 ? "s are" : " is"} being restricted upstream` : "All monitored systems are operational", [summary]);
 
   async function addEndpoint(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    setBusy("create");
+    event.preventDefault(); const formElement = event.currentTarget; const form = new FormData(formElement); setBusy("create");
     try {
-      const endpoint = await api.create({
-        name: form.get("name"),
-        url: form.get("url"),
-        interval_seconds: Number(form.get("interval_seconds")),
-        timeout_seconds: 10,
-        expected_status: Number(form.get("expected_status")),
-      });
-      setShowForm(false);
-      event.currentTarget.reset();
-      await api.check(endpoint.id);
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to add monitor");
-    } finally {
-      setBusy(null);
-    }
+      const endpoint = await api.create({ name: form.get("name"), url: form.get("url"), method: form.get("method"), interval_seconds: Number(form.get("interval_seconds")), timeout_seconds: Number(form.get("timeout_seconds")), expected_status: Number(form.get("expected_status")), failure_threshold: Number(form.get("failure_threshold")), recovery_threshold: Number(form.get("recovery_threshold")), ssl_expiry_enabled: true });
+      setShowForm(false); formElement.reset(); await api.check(endpoint.id); await load(true); setSelectedId(endpoint.id);
+    } catch (err) { setError(err instanceof Error ? err.message : "Unable to add monitor"); } finally { setBusy(null); }
   }
 
-  async function checkNow(id: string) {
-    setBusy(id);
-    try {
-      await api.check(id);
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Check failed");
-    } finally {
-      setBusy(null);
-    }
+  async function checkNow(id: string) { setBusy(id); try { await api.check(id); await load(true); } catch (err) { setError(err instanceof Error ? err.message : "Check failed"); } finally { setBusy(null); } }
+  async function toggleEndpoint(endpoint: Endpoint) { setBusy(endpoint.id); try { await api.update(endpoint.id, { is_active: !endpoint.is_active }); await load(true); } catch (err) { setError(err instanceof Error ? err.message : "Update failed"); } finally { setBusy(null); } }
+  async function removeEndpoint(endpoint: Endpoint) { if (!window.confirm(`Delete ${endpoint.name} and its monitoring history?`)) return; setBusy(endpoint.id); try { await api.remove(endpoint.id); setSelectedId(null); await load(true); } catch (err) { setError(err instanceof Error ? err.message : "Delete failed"); } finally { setBusy(null); } }
+
+  async function createMaintenance(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const form = new FormData(event.currentTarget); setBusy("maintenance"); try { await api.createMaintenance({ title: form.get("title"), endpoint_id: form.get("endpoint_id") || null, starts_at: new Date(String(form.get("starts_at"))).toISOString(), ends_at: new Date(String(form.get("ends_at"))).toISOString() }); setShowMaintenance(false); await load(true); } catch (err) { setError(err instanceof Error ? err.message : "Unable to schedule maintenance"); } finally { setBusy(null); } }
+  async function removeMaintenance(id: string) { setBusy(id); try { await api.removeMaintenance(id); await load(true); } catch (err) { setError(err instanceof Error ? err.message : "Unable to remove maintenance"); } finally { setBusy(null); } }
+  async function manageIncident(incident: Incident, action: "acknowledge" | "resolve") { setBusy(incident.id); try { await api.updateIncident(incident.id, action === "acknowledge" ? { acknowledged_by: "Aditya Singh" } : { resolve: true }); await load(true); } catch (err) { setError(err instanceof Error ? err.message : "Unable to update incident"); } finally { setBusy(null); } }
+  async function runDiagnostics(id: string) { setBusy(`diagnostics-${id}`); setDiagnostics(null); try { setDiagnostics(await api.diagnostics(id)); } catch (err) { setError(err instanceof Error ? err.message : "Diagnostics failed"); } finally { setBusy(null); } }
+
+  function exportCsv() {
+    const rows = [["Name", "URL", "Status", "Uptime", "Average latency", "P95 latency", "Last checked"], ...filteredEndpoints.map((endpoint) => { const metric = metrics[endpoint.id]; return [endpoint.name, endpoint.url, endpointState(endpoint), metric?.uptime_percentage ?? "", metric?.average_latency_ms ?? "", metric?.p95_latency_ms ?? "", endpoint.latest_check?.checked_at ?? ""]; })];
+    const csv = rows.map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(",")).join("\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); const link = document.createElement("a"); link.href = url; link.download = `pulsewatch-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url);
   }
 
-  async function remove(id: string) {
-    setBusy(id);
-    try {
-      await api.remove(id);
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Delete failed");
-    } finally {
-      setBusy(null);
-    }
-  }
+  return <div className="app-shell">
+    <aside className="sidebar"><div className="brand"><span className="brand-mark"><i /><i /><i /></span><span>PulseWatch<small>Observability</small></span></div><nav aria-label="Primary navigation"><button className={view === "overview" ? "active" : ""} onClick={() => setView("overview")}><span>⌁</span>Overview</button><button className={view === "monitors" ? "active" : ""} onClick={() => setView("monitors")}><span>◉</span>Monitors<em>{summary.total}</em></button><button className={view === "incidents" ? "active" : ""} onClick={() => setView("incidents")}><span>⚡</span>Incidents{activeIncidents.length > 0 && <em className="alert-count">{activeIncidents.length}</em>}</button><button className={view === "operations" ? "active" : ""} onClick={() => setView("operations")}><span>⚙</span>Operations<em>{maintenance.length}</em></button></nav><div className="sidebar-spacer" /><div className="environment-card"><div><i /><span>Local environment</span></div><strong>All systems connected</strong><small>PostgreSQL · Redis · Celery</small></div><a className="repo-link" href="https://github.com/Adityagithubhack/pulsewatch" target="_blank" rel="noreferrer">GitHub repository <span>↗</span></a></aside>
 
-  const statusText = useMemo(() => {
-    if (!summary.total) return "No monitors configured";
-    if (summary.down) return `${summary.down} service${summary.down > 1 ? "s" : ""} need attention`;
-    return "All monitored services are operational";
-  }, [summary]);
+    <main className="workspace"><header className="workspace-header"><div><span className="mobile-brand">PulseWatch / </span><p>{view === "overview" ? "Operations overview" : view === "monitors" ? "Monitor inventory" : view === "incidents" ? "Incident management" : "Operations control"}</p><small>{lastUpdated ? `Last synchronized ${relativeTime(lastUpdated.toISOString())}` : "Connecting to telemetry…"}</small></div><div className="header-actions"><label className="live-toggle"><input type="checkbox" checked={autoRefresh} onChange={(event) => setAutoRefresh(event.target.checked)} /><span />Live</label><button className="icon-button" onClick={() => void load()} disabled={refreshing} aria-label="Refresh">{refreshing ? "…" : "↻"}</button><button className="primary" onClick={() => setShowForm(true)}>＋ New monitor</button></div></header>
+      {error && <div className="error" role="alert"><strong>Unable to complete request</strong><span>{error}</span><button onClick={() => setError("")}>×</button></div>}
 
-  return (
-    <main>
-      <header className="topbar">
-        <div className="brand"><span className="pulse" />PulseWatch</div>
-        <button className="primary" onClick={() => setShowForm(!showForm)}>{showForm ? "Close" : "+ New monitor"}</button>
-      </header>
+      {view === "overview" && <><section className="page-intro"><div><p className="eyebrow">Command center</p><h1>Infrastructure health</h1><p>Real-time availability, latency, and reliability intelligence across your monitored fleet.</p></div><RangeSwitcher value={timeRange} onChange={setTimeRange} /></section><div className={`system-banner ${summary.down ? "danger" : summary.blocked ? "warning" : "healthy"}`}><span className="beacon" /><div><strong>{statusText}</strong><small>{summary.down ? "Incident workflow is active" : summary.blocked ? "Availability data excludes restricted probes" : "No active service disruptions detected"}</small></div><span className="banner-time">Updated {lastUpdated ? relativeTime(lastUpdated.toISOString()) : "now"}</span></div>
+        <section className="kpi-grid"><article><div className="kpi-label"><span>Fleet uptime</span><i className="success">SLO</i></div><strong>{fleetUptime == null ? "—" : `${fleetUptime.toFixed(2)}%`}</strong><small>Across {fleetUptimes.length} measured services</small></article><article><div className="kpi-label"><span>Average latency</span><i>AVG</i></div><strong>{formatNumber(summary.average_latency_ms, " ms")}</strong><small>Current fleet response time</small></article><article><div className="kpi-label"><span>Open incidents</span><i className={activeIncidents.length ? "danger" : "success"}>LIVE</i></div><strong>{activeIncidents.length}</strong><small>{resolvedIncidents.length} resolved in history</small></article><article><div className="kpi-label"><span>Health score</span><i>NOW</i></div><strong>{healthScore == null ? "—" : `${healthScore}%`}</strong><small>{summary.up} of {activeCount} active monitors up</small></article></section>
+        <section className="analytics-grid"><article className="panel chart-panel"><div className="panel-heading"><div><p className="eyebrow">Performance telemetry</p><h2>Latency trend</h2></div><div className="legend"><i />Response time</div></div><div className="chart-summary"><strong>{formatNumber(chartMetrics?.average_latency_ms ?? null, " ms")}</strong><span>average</span><b>P95 {formatNumber(chartMetrics?.p95_latency_ms ?? null, " ms")}</b></div><LatencyChart checks={chartMetrics?.series ?? []} /></article><article className="panel reliability-panel"><div className="panel-heading"><div><p className="eyebrow">Reliability</p><h2>SLO posture</h2></div><span className="slo-target">{sloTarget}% target</span></div><div className="score-ring" style={{ "--score": `${Math.min(100, fleetUptime ?? 0) * 3.6}deg` } as React.CSSProperties}><div><strong>{fleetUptime == null ? "—" : fleetUptime.toFixed(2)}</strong><span>% uptime</span></div></div><div className="reliability-stats"><div><span>Error budget left</span><strong>{budgetRemaining == null ? "—" : `${budgetRemaining.toFixed(1)} min`}</strong></div><div><span>Mean time to recovery</span><strong>{mttr == null ? "—" : `${Math.round(mttr)} min`}</strong></div></div><small className="calculation-note">Estimated from checks in the selected {rangeLabels[timeRange]} window.</small></article></section>
+        <section className="panel section-panel"><div className="panel-heading"><div><p className="eyebrow">Service inventory</p><h2>Live monitors</h2></div><button className="text-button" onClick={() => setView("monitors")}>View all monitors →</button></div><MonitorTable endpoints={endpoints.slice(0, 5)} metrics={metrics} busy={busy} onSelect={setSelectedId} onCheck={checkNow} loading={loading} /></section>
+        <section className="panel section-panel"><div className="panel-heading"><div><p className="eyebrow">Operational timeline</p><h2>Recent incidents</h2></div><button className="text-button" onClick={() => setView("incidents")}>Open incident center →</button></div><IncidentList incidents={incidents.slice(0, 5)} /></section></>}
 
-      <section className="hero">
-        <p className="eyebrow">Infrastructure overview</p>
-        <h1>Know when your services fail.</h1>
-        <p className="lede">Monitor APIs and websites, inspect latency, and receive incident alerts from one focused dashboard.</p>
-        <div className={`system-state ${summary.down ? "danger" : "healthy"}`}>
-          <span />{statusText}
-        </div>
-      </section>
-
-      {showForm && (
-        <form className="monitor-form" onSubmit={addEndpoint}>
-          <label>Name<input name="name" required minLength={2} placeholder="Production API" /></label>
-          <label>URL<input name="url" required type="url" placeholder="https://api.example.com/health" /></label>
-          <label>Interval<select name="interval_seconds" defaultValue="60"><option value="30">30 seconds</option><option value="60">1 minute</option><option value="300">5 minutes</option></select></label>
-          <label>Expected status<input name="expected_status" type="number" min="100" max="599" defaultValue="200" /></label>
-          <button className="primary" disabled={busy === "create"}>{busy === "create" ? "Creating…" : "Start monitoring"}</button>
-        </form>
-      )}
-
-      {error && <div className="error" role="alert">{error}</div>}
-
-      <section className="stats">
-        <article><span>Total monitors</span><strong>{summary.total}</strong></article>
-        <article><span>Operational</span><strong className="green">{summary.up}</strong></article>
-        <article><span>Incidents</span><strong className="red">{summary.down}</strong></article>
-        <article><span>Average latency</span><strong>{summary.average_latency_ms == null ? "—" : `${Math.round(summary.average_latency_ms)} ms`}</strong></article>
-      </section>
-
-      <section className="monitors">
-        <div className="section-title"><div><p className="eyebrow">Live monitors</p><h2>Services</h2></div><button className="ghost" onClick={load}>Refresh</button></div>
-        {loading ? <div className="empty">Loading monitors…</div> : endpoints.length === 0 ? (
-          <div className="empty"><strong>No services yet</strong><p>Add your first public API or website to begin collecting uptime data.</p></div>
-        ) : (
-          <div className="monitor-list">
-            {endpoints.map((endpoint) => {
-              const state = !endpoint.is_active ? "paused" : endpoint.latest_check?.status ?? "pending";
-              return (
-                <article className="monitor" key={endpoint.id}>
-                  <div className={`status-dot ${state}`} />
-                  <div className="monitor-main"><strong>{endpoint.name}</strong><a href={endpoint.url} target="_blank" rel="noreferrer">{endpoint.url}</a></div>
-                  <div className="metric"><span>24h uptime</span><strong>{metrics[endpoint.id]?.uptime_percentage == null ? "—" : `${metrics[endpoint.id].uptime_percentage}%`}</strong></div>
-                  <div className="metric"><span>HTTP</span><strong>{endpoint.latest_check?.status_code ?? "—"}</strong></div>
-                  <div className="metric"><span>P95 latency</span><strong>{metrics[endpoint.id]?.p95_latency_ms == null ? "—" : `${Math.round(metrics[endpoint.id].p95_latency_ms!)} ms`}</strong></div>
-                  <div className="actions"><button onClick={() => checkNow(endpoint.id)} disabled={busy === endpoint.id}>Check</button><button className="delete" onClick={() => remove(endpoint.id)} disabled={busy === endpoint.id}>Remove</button></div>
-                </article>
-              );
-            })}
-          </div>
-        )}
-      </section>
-
-      <section className="incidents">
-        <div className="section-title"><div><p className="eyebrow">Operational timeline</p><h2>Recent incidents</h2></div></div>
-        {incidents.length === 0 ? (
-          <div className="empty"><strong>No incidents recorded</strong><p>Service failures and recoveries will appear here automatically.</p></div>
-        ) : (
-          <div className="incident-list">
-            {incidents.map((incident) => (
-              <article className="incident" key={incident.id}>
-                <div className={`incident-state ${incident.resolved_at ? "resolved" : "open"}`}>{incident.resolved_at ? "Resolved" : "Open"}</div>
-                <div><strong>{incident.endpoint_name}</strong><span>{incident.cause ?? `HTTP ${incident.opening_status_code ?? "failure"}`}</span></div>
-                <time>{new Date(incident.opened_at).toLocaleString()}</time>
-              </article>
-            ))}
-          </div>
-        )}
-      </section>
+      {view === "monitors" && <section className="page-view"><div className="page-intro"><div><p className="eyebrow">Service inventory</p><h1>Monitors</h1><p>Inspect availability, latency, configuration, and live probe results.</p></div><RangeSwitcher value={timeRange} onChange={setTimeRange} /></div><div className="toolbar"><label className="search-box"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by name or URL" /></label><div className="filter-row">{(["all", "up", "down", "blocked", "paused"] as StatusFilter[]).map((filter) => <button key={filter} className={statusFilter === filter ? "active" : ""} onClick={() => setStatusFilter(filter)}>{filter}</button>)}</div><button className="secondary" onClick={exportCsv}>↓ Export CSV</button></div><section className="panel section-panel"><div className="table-meta"><span>{filteredEndpoints.length} monitor{filteredEndpoints.length === 1 ? "" : "s"}</span><small>Availability excludes blocked probes</small></div><MonitorTable endpoints={filteredEndpoints} metrics={metrics} busy={busy} onSelect={setSelectedId} onCheck={checkNow} loading={loading} /></section></section>}
+      {view === "incidents" && <section className="page-view"><div className="page-intro"><div><p className="eyebrow">Reliability operations</p><h1>Incidents</h1><p>Acknowledge, investigate, and resolve every confirmed service failure.</p></div><div className="incident-totals"><span><strong>{activeIncidents.length}</strong> Open</span><span><strong>{resolvedIncidents.length}</strong> Resolved</span></div></div><div className="incident-tabs">{(["all", "open", "resolved"] as const).map((filter) => <button key={filter} className={incidentFilter === filter ? "active" : ""} onClick={() => setIncidentFilter(filter)}>{filter}</button>)}</div><section className="panel section-panel"><IncidentList incidents={filteredIncidents} detailed busy={busy} onManage={manageIncident} /></section></section>}
+      {view === "operations" && <section className="page-view"><div className="page-intro"><div><p className="eyebrow">Control plane</p><h1>Operations</h1><p>Maintenance scheduling, alert integrations, public telemetry, and immutable activity history.</p></div><button className="primary" onClick={() => setShowMaintenance(true)}>＋ Schedule maintenance</button></div><section className="operations-grid"><article className="panel ops-card"><div className="panel-heading"><div><p className="eyebrow">Alert delivery</p><h2>Notification channels</h2></div><span className="ops-count">{Object.values(notifications).filter(Boolean).length}/3 active</span></div><div className="integration-list"><Integration name="Telegram" active={notifications.telegram} detail="Instant incident and recovery messages" /><Integration name="Webhook" active={notifications.webhook} detail="POST events to automation platforms" /><Integration name="Email / SMTP" active={notifications.email} detail="Operational email escalation" /></div><p className="ops-help">Configure channel credentials in <code>.env</code>; secrets are never exposed to the browser.</p></article><article className="panel ops-card"><div className="panel-heading"><div><p className="eyebrow">External communication</p><h2>Public status API</h2></div><span className="status-badge up"><i />Live</span></div><p className="ops-description">A customer-safe status feed exposes service health without internal diagnostics or configuration.</p><a className="endpoint-link" href="http://localhost:8000/api/public/status" target="_blank" rel="noreferrer">/api/public/status <span>↗</span></a><a className="endpoint-link" href="http://localhost:8000/metrics" target="_blank" rel="noreferrer">/metrics <span>↗</span></a><a className="endpoint-link" href="http://localhost:8000/health/ready" target="_blank" rel="noreferrer">/health/ready <span>↗</span></a></article></section><section className="panel section-panel"><div className="panel-heading"><div><p className="eyebrow">Change suppression</p><h2>Maintenance windows</h2></div><button className="text-button" onClick={() => setShowMaintenance(true)}>Schedule window →</button></div>{maintenance.length ? <div className="maintenance-list">{maintenance.map((window) => <div key={window.id}><span className="maintenance-icon">◷</span><div><strong>{window.title}</strong><small>{window.endpoint_id ? endpoints.find((endpoint) => endpoint.id === window.endpoint_id)?.name ?? "Service" : "All services"}</small></div><div><strong>{new Date(window.starts_at).toLocaleString()}</strong><small>to {new Date(window.ends_at).toLocaleString()}</small></div><button disabled={busy === window.id} onClick={() => void removeMaintenance(window.id)}>Remove</button></div>)}</div> : <div className="empty-state"><span className="empty-icon">◷</span><strong>No maintenance scheduled</strong><p>Create a window to suppress false incidents during planned work.</p></div>}</section><section className="panel section-panel"><div className="panel-heading"><div><p className="eyebrow">Governance</p><h2>Audit log</h2></div><span className="ops-count">Last {auditLog.length} events</span></div><div className="audit-list">{auditLog.map((entry) => <div key={entry.id}><span className="audit-dot" /><strong>{entry.action.replaceAll(".", " ")}</strong><span>{entry.detail ?? entry.resource_type}</span><small>{entry.actor} · {relativeTime(entry.created_at)}</small></div>)}{!auditLog.length && <div className="empty-state"><strong>No activity recorded yet</strong></div>}</div></section></section>}
     </main>
-  );
+
+    {showForm && <div className="overlay" onMouseDown={() => setShowForm(false)}><form className="modal" onMouseDown={(event) => event.stopPropagation()} onSubmit={addEndpoint}><div className="modal-header"><div><p className="eyebrow">Create monitor</p><h2>Monitor a service</h2><span>Configure probing and noise-resistant incident policy.</span></div><button type="button" onClick={() => setShowForm(false)}>×</button></div><div className="form-grid"><label className="wide">Monitor name<input name="name" required minLength={2} placeholder="Production API" autoFocus /></label><label className="wide">Endpoint URL<input name="url" required type="url" placeholder="https://api.example.com/health" /></label><label>Method<select name="method" defaultValue="GET"><option>GET</option><option>HEAD</option></select></label><label>Expected HTTP<input name="expected_status" type="number" min="100" max="599" defaultValue="200" /></label><label>Check interval<select name="interval_seconds" defaultValue="60"><option value="30">30 seconds</option><option value="60">1 minute</option><option value="300">5 minutes</option><option value="900">15 minutes</option></select></label><label>Timeout<select name="timeout_seconds" defaultValue="10"><option value="5">5 seconds</option><option value="10">10 seconds</option><option value="20">20 seconds</option><option value="30">30 seconds</option></select></label><label>Failures before incident<select name="failure_threshold" defaultValue="2"><option value="1">1 failure</option><option value="2">2 failures</option><option value="3">3 failures</option><option value="5">5 failures</option></select></label><label>Checks before recovery<select name="recovery_threshold" defaultValue="1"><option value="1">1 success</option><option value="2">2 successes</option><option value="3">3 successes</option></select></label></div><div className="modal-note"><span>✓</span> SSRF protection, TLS inspection, retry/backoff, and alert deduplication are enabled.</div><div className="modal-actions"><button type="button" className="secondary" onClick={() => setShowForm(false)}>Cancel</button><button className="primary" disabled={busy === "create"}>{busy === "create" ? "Creating monitor…" : "Create monitor"}</button></div></form></div>}
+    {showMaintenance && <div className="overlay" onMouseDown={() => setShowMaintenance(false)}><form className="modal maintenance-modal" onMouseDown={(event) => event.stopPropagation()} onSubmit={createMaintenance}><div className="modal-header"><div><p className="eyebrow">Planned work</p><h2>Schedule maintenance</h2><span>Checks continue, but incident creation and recovery alerts are suppressed.</span></div><button type="button" onClick={() => setShowMaintenance(false)}>×</button></div><div className="form-grid"><label className="wide">Window title<input name="title" required minLength={2} placeholder="Database migration" autoFocus /></label><label className="wide">Scope<select name="endpoint_id" defaultValue=""><option value="">All monitored services</option>{endpoints.map((endpoint) => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></label><label>Starts at<input name="starts_at" required type="datetime-local" /></label><label>Ends at<input name="ends_at" required type="datetime-local" /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={() => setShowMaintenance(false)}>Cancel</button><button className="primary" disabled={busy === "maintenance"}>{busy === "maintenance" ? "Scheduling…" : "Schedule window"}</button></div></form></div>}
+    {selectedEndpoint && <div className="drawer-backdrop" onMouseDown={() => setSelectedId(null)}><aside className="drawer" onMouseDown={(event) => event.stopPropagation()}><div className="drawer-header"><div><StatusBadge state={endpointState(selectedEndpoint)} /><h2>{selectedEndpoint.name}</h2><a href={selectedEndpoint.url} target="_blank" rel="noreferrer">{selectedEndpoint.url} ↗</a></div><button onClick={() => setSelectedId(null)}>×</button></div><div className="drawer-actions"><button className="primary" disabled={busy === selectedEndpoint.id || !selectedEndpoint.is_active} onClick={() => void checkNow(selectedEndpoint.id)}>{busy === selectedEndpoint.id ? "Checking…" : "Run check now"}</button><button className="secondary" disabled={busy === selectedEndpoint.id} onClick={() => void toggleEndpoint(selectedEndpoint)}>{selectedEndpoint.is_active ? "Pause" : "Resume"}</button></div><section className="drawer-section"><div className="mini-metrics"><div><span>{rangeLabels[timeRange]} uptime</span><strong>{selectedMetrics?.uptime_percentage == null ? "—" : `${selectedMetrics.uptime_percentage}%`}</strong></div><div><span>Average</span><strong>{formatNumber(selectedMetrics?.average_latency_ms ?? null, " ms")}</strong></div><div><span>P95</span><strong>{formatNumber(selectedMetrics?.p95_latency_ms ?? null, " ms")}</strong></div></div><LatencyChart checks={selectedMetrics?.series ?? []} compact /></section><section className="drawer-section"><div className="drawer-title"><h3>Configuration</h3><span>Active probe policy</span></div><dl className="config-list"><div><dt>Method</dt><dd>{selectedEndpoint.method}</dd></div><div><dt>Expected response</dt><dd>HTTP {selectedEndpoint.expected_status}</dd></div><div><dt>Interval / timeout</dt><dd>{selectedEndpoint.interval_seconds}s / {selectedEndpoint.timeout_seconds}s</dd></div><div><dt>Failure confirmation</dt><dd>{selectedEndpoint.failure_threshold} consecutive</dd></div><div><dt>Recovery confirmation</dt><dd>{selectedEndpoint.recovery_threshold} consecutive</dd></div></dl></section><section className="drawer-section"><div className="drawer-title"><h3>DNS & TLS diagnostics</h3><button className="mini-button" disabled={busy === `diagnostics-${selectedEndpoint.id}`} onClick={() => void runDiagnostics(selectedEndpoint.id)}>{busy === `diagnostics-${selectedEndpoint.id}` ? "Inspecting…" : "Run diagnostics"}</button></div>{diagnostics ? <dl className="config-list diagnostics"><div><dt>Hostname</dt><dd>{diagnostics.hostname}</dd></div><div><dt>DNS latency</dt><dd>{formatNumber(diagnostics.dns_latency_ms, " ms")}</dd></div><div><dt>Resolved IPs</dt><dd>{diagnostics.resolved_addresses.join(", ")}</dd></div><div><dt>TLS status</dt><dd className={diagnostics.tls_status}>{diagnostics.tls_status}</dd></div><div><dt>Certificate expiry</dt><dd>{diagnostics.tls_days_remaining == null ? "Not applicable" : `${diagnostics.tls_days_remaining} days`}</dd></div></dl> : <p className="diagnostics-empty">Inspect DNS resolution and the live TLS certificate without exposing internal addresses.</p>}</section><section className="drawer-section"><div className="drawer-title"><h3>Recent checks</h3><span>Latest telemetry</span></div><div className="check-list">{(selectedMetrics?.series ?? []).slice(-7).reverse().map((check) => <div key={check.id}><StatusBadge state={check.availability} /><span>HTTP {check.status_code ?? "—"}</span><span>{formatNumber(check.latency_ms, " ms")}</span><time>{relativeTime(check.checked_at)}</time></div>)}{!selectedMetrics?.series.length && <p>No checks recorded in this window.</p>}</div></section><button className="danger-button" onClick={() => void removeEndpoint(selectedEndpoint)}>Delete monitor and history</button></aside></div>}
+  </div>;
+}
+
+function RangeSwitcher({ value, onChange }: { value: RangeHours; onChange: (value: RangeHours) => void }) { return <div className="range-switcher">{([24, 168, 720] as RangeHours[]).map((range) => <button key={range} className={value === range ? "active" : ""} onClick={() => onChange(range)}>{rangeLabels[range]}</button>)}</div>; }
+
+function MonitorTable({ endpoints, metrics, busy, onSelect, onCheck, loading }: { endpoints: Endpoint[]; metrics: Record<string, Metrics>; busy: string | null; onSelect: (id: string) => void; onCheck: (id: string) => Promise<void>; loading: boolean }) {
+  if (loading) return <div className="empty-state"><span className="loader" /><strong>Loading telemetry</strong><p>Synchronizing checks and incidents…</p></div>;
+  if (!endpoints.length) return <div className="empty-state"><span className="empty-icon">◎</span><strong>No matching monitors</strong><p>Create a monitor or change the active filters.</p></div>;
+  return <div className="monitor-table"><div className="table-head"><span>Service</span><span>Status</span><span>Uptime</span><span>Avg latency</span><span>P95</span><span>Last check</span><span /></div>{endpoints.map((endpoint) => { const metric = metrics[endpoint.id], state = endpointState(endpoint); let hostname = endpoint.url; try { hostname = new URL(endpoint.url).hostname; } catch { /* API validation guarantees URLs */ } return <div className="table-row" key={endpoint.id} onClick={() => onSelect(endpoint.id)}><div className="service-cell"><span className={`service-icon ${state}`}>{endpoint.name.slice(0, 2).toUpperCase()}</span><div><strong>{endpoint.name}</strong><small>{endpoint.method} · {hostname}</small></div></div><StatusBadge state={state} /><strong>{metric?.uptime_percentage == null ? "—" : `${metric.uptime_percentage}%`}</strong><span>{formatNumber(metric?.average_latency_ms ?? null, " ms")}</span><span>{formatNumber(metric?.p95_latency_ms ?? null, " ms")}</span><span>{relativeTime(endpoint.latest_check?.checked_at ?? null)}</span><button className="row-action" disabled={busy === endpoint.id || !endpoint.is_active} onClick={(event) => { event.stopPropagation(); void onCheck(endpoint.id); }}>{busy === endpoint.id ? "…" : "↻"}</button></div>; })}</div>;
+}
+
+function IncidentList({ incidents, detailed = false, busy = null, onManage }: { incidents: Incident[]; detailed?: boolean; busy?: string | null; onManage?: (incident: Incident, action: "acknowledge" | "resolve") => Promise<void> }) {
+  if (!incidents.length) return <div className="empty-state"><span className="empty-icon success">✓</span><strong>No incidents found</strong><p>Service failures and automatic recoveries will appear here.</p></div>;
+  return <div className={`incident-list ${detailed ? "detailed" : ""}`}>{incidents.map((incident) => <article className="incident-row" key={incident.id}><span className={`incident-icon ${incident.resolved_at ? "resolved" : "open"}`}>{incident.resolved_at ? "✓" : "!"}</span><div className="incident-copy"><div><strong>{incident.endpoint_name}</strong><span className={`incident-state ${incident.resolved_at ? "resolved" : "open"}`}>{incident.resolved_at ? "Resolved" : incident.acknowledged_at ? "Acknowledged" : "Investigating"}</span></div><p>{incident.cause ?? `Unexpected HTTP ${incident.opening_status_code ?? "failure"}`}</p>{incident.acknowledged_by && <small>Acknowledged by {incident.acknowledged_by}</small>}{detailed && <a href={incident.endpoint_url} target="_blank" rel="noreferrer">{incident.endpoint_url}</a>}</div><div className="incident-time"><strong>{incidentDuration(incident)}</strong><span>{relativeTime(incident.opened_at)}</span>{detailed && !incident.resolved_at && onManage && <div className="incident-actions">{!incident.acknowledged_at && <button disabled={busy === incident.id} onClick={() => void onManage(incident, "acknowledge")}>Acknowledge</button>}<button disabled={busy === incident.id} onClick={() => void onManage(incident, "resolve")}>Resolve</button></div>}</div></article>)}</div>;
+}
+
+function Integration({ name, active, detail }: { name: string; active: boolean; detail: string }) {
+  return <div><span className={`integration-icon ${active ? "active" : ""}`}>{active ? "✓" : "—"}</span><div><strong>{name}</strong><small>{detail}</small></div><span className={`integration-state ${active ? "active" : ""}`}>{active ? "Configured" : "Disabled"}</span></div>;
 }

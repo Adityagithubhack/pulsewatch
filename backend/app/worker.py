@@ -34,7 +34,9 @@ async def _schedule_due() -> list[str]:
     due: list[str] = []
     now = datetime.now(UTC)
     async with SessionLocal() as db:
-        endpoints = (await db.scalars(select(Endpoint).where(Endpoint.is_active.is_(True)))).all()
+        endpoints = (
+            await db.scalars(select(Endpoint).where(Endpoint.is_active.is_(True)))
+        ).all()
         for endpoint in endpoints:
             latest = await db.scalar(
                 select(CheckResult)
@@ -42,7 +44,11 @@ async def _schedule_due() -> list[str]:
                 .order_by(CheckResult.checked_at.desc())
                 .limit(1)
             )
-            if latest is None or (now - latest.checked_at).total_seconds() >= endpoint.interval_seconds:
+            if (
+                latest is None
+                or (now - latest.checked_at).total_seconds()
+                >= endpoint.interval_seconds
+            ):
                 due.append(str(endpoint.id))
     return due
 

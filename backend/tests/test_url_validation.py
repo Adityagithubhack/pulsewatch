@@ -5,7 +5,10 @@ from app.services.url_safety import validate_monitor_url
 
 class UrlValidationTests(unittest.TestCase):
     def test_accepts_public_https_url(self):
-        self.assertEqual(validate_monitor_url("https://example.com/health"), "https://example.com/health")
+        self.assertEqual(
+            validate_monitor_url("https://example.com/health"),
+            "https://example.com/health",
+        )
 
     def test_rejects_localhost(self):
         with self.assertRaises(ValueError):
