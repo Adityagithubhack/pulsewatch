@@ -21,6 +21,14 @@ PulseWatch is a full-stack observability platform that performs scheduled health
 
 The project uses asynchronous API handlers, background task processing, persistent check history, Redis event distribution, and a responsive operational dashboard.
 
+## Dashboard Preview
+
+<p align="center">
+  <img src="assets/pulsewatch-dashboard.png" alt="PulseWatch operations dashboard with uptime, latency, SLO, incidents, and monitor inventory" width="100%" />
+</p>
+
+The dashboard is connected to real public HTTP services. It displays observed response codes and latency rather than sample data.
+
 ## Features
 
 - Configurable `GET` and `HEAD` monitors for public websites and APIs
@@ -203,11 +211,10 @@ npm audit --omit=dev
 
 Current verification status:
 
-- Backend lint passes
-- URL safety tests pass
-- Next.js production build passes
-- TypeScript validation passes
-- Production dependency audit reports zero known vulnerabilities
+- GitHub Actions CI is green for the `v1.0.0` release
+- Backend: Ruff validation and 9 automated tests pass
+- Frontend: Next.js production build and TypeScript validation pass
+- Docker Compose environment verified locally with PostgreSQL and Redis readiness checks
 
 ## Continuous Integration and Deployment
 
@@ -250,13 +257,12 @@ pulsewatch/
 
 ## Roadmap
 
-- Authentication and per-user monitor ownership
-- Team workspaces and role-based access control
-- Team workspaces, SSO, and fine-grained role-based access control
+- Multi-user workspaces and fine-grained role-based access control
+- OIDC/SSO and managed API-key lifecycle
 - Dedicated remote probe agents for genuine multi-region monitoring
 - Domain-registration expiration monitoring
-- Alembic database migrations
-- DNS resolution checks for stronger SSRF protection
+- Alert delivery retries, channel health, and escalation policies
+- Alembic migration workflow replacing compatibility migrations
 
 ## Author
 
